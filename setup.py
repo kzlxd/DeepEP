@@ -29,8 +29,8 @@ if __name__ == '__main__':
         sources.extend(['csrc/kernels/internode.cu', 'csrc/kernels/internode_ll.cu'])
         include_dirs.extend([f'{nvshmem_dir}/include'])
         library_dirs.extend([f'{nvshmem_dir}/lib'])
-        nvcc_dlink.extend(['-dlink', f'-L{nvshmem_dir}/lib', '-lnvshmem'])
-        extra_link_args.extend(['-l:libnvshmem.a', '-l:nvshmem_bootstrap_uid.so', f'-Wl,-rpath,{nvshmem_dir}/lib'])
+        nvcc_dlink.extend(['-dlink', f'-L{nvshmem_dir}/lib', '-lnvshmem_device'])
+        extra_link_args.extend(['-l:libnvshmem_host.so', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_dir}/lib'])
 
     if int(os.getenv('DISABLE_SM90_FEATURES', 0)):
         # Prefer A100
@@ -40,8 +40,8 @@ if __name__ == '__main__':
         cxx_flags.append('-DDISABLE_SM90_FEATURES')
         nvcc_flags.append('-DDISABLE_SM90_FEATURES')
 
-        # Disable internode and low-latency kernels
-        assert disable_nvshmem
+        # CUDA 12 flags
+        nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])
     else:
         # Prefer H800 series
         os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '9.0')

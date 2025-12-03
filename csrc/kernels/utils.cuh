@@ -471,6 +471,23 @@ barrier_block(int** barrier_signal_ptrs, int rank) {
     __syncthreads();
 }
 
+#ifdef DISABLE_SM90_FEATURES
+// SM80兼容版本：使用标准的原子操作和内存栅栏
+__forceinline__ __device__ int atomic_cas_cta_acquire(int* addr, int x, int y) {
+    int ret = atomicCAS(addr, x, y);
+    // Acquire semantics: ensure subsequent loads/stores are not reordered before this
+    __threadfence_block();
+    return ret;
+}
+
+__forceinline__ __device__ int atomic_exch_cta_release(int* addr, int x) {
+    // Release semantics: ensure prior loads/stores are visible before the exchange
+    __threadfence_block();
+    int ret = atomicExch(addr, x);
+    return ret;
+}
+#else
+// SM90优化版本：使用PTX指令进行更高效的原子操作
 __forceinline__ __device__ int atomic_cas_cta_acquire(int* addr, int x, int y) {
     int ret;
     asm volatile("atom.acquire.cta.shared::cta.cas.b32 %0, [%1], %2, %3;" : "=r"(ret) : "l"(addr), "r"(x), "r"(y) : "memory");
@@ -482,6 +499,8 @@ __forceinline__ __device__ int atomic_exch_cta_release(int* addr, int x) {
     asm volatile("atom.release.cta.shared::cta.exch.b32 %0, [%1], %2;" : "=r"(ret) : "l"(addr), "r"(x) : "memory");
     return ret;
 }
+#endif
+
 
 __forceinline__ __device__ void acquire_lock(int* mutex) {
     // To make later memory operations valid, we must use `acquire` for memory semantics

@@ -99,10 +99,14 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
             check_end = recv_gbl_rank_prefix_sum[i].item()
             assert (check_x[check_start:check_end, :].int() - i).sum().item() == 0
             check_start = check_end
-
+                # Skip FP8 tests on SM80 (A100) as it doesn't support FP8
+    is_sm80 = int(os.getenv('DISABLE_SM90_FEATURES', 0)) == 1
+    test_x_list = [x_pure_rand, x]
+    if not is_sm80:
+        test_x_list.extend([x_e4m3])
     for previous_mode in (False, True):
         for async_mode in (False, True):
-            for current_x in (x_pure_rand, x, x_e4m3):
+            for current_x in test_x_list:
                 for with_topk in (False, True):
                     if local_rank == 0:
                         print(f'[testing] Running with {"FP8" if isinstance(current_x, tuple) else "BF16"}, {"with" if with_topk else "without"} top-k (async={async_mode}, previous={previous_mode}) ...', flush=True, end='')
@@ -174,6 +178,10 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
         print('', flush=True)
 
     # Tune dispatch performance
+    is_sm80 = int(os.getenv('DISABLE_SM90_FEATURES', 0)) == 1
+    test_x_list = [x]
+    if not is_sm80:
+        test_x_list.extend([x_e4m3])
     best_dispatch_results = None
     fp8_factor = (1 + 4 / 128) / 2
     for current_x in (x_e4m3, x):
