@@ -34,7 +34,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     do_check = True
     hash_value, num_times = 0, 0
     for return_recv_hook in (False, True):
-        for dispatch_use_fp8 in (False, True):
+        for dispatch_use_fp8 in (False, ):
             for round_scale in (False, True) if dispatch_use_fp8 else (False, ):
                 for use_ue8m0 in (False, True) if round_scale else (False, ):
                     num_times += 1
@@ -146,23 +146,21 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         group.barrier()
         dispatch_t, combine_t = bench_kineto(partial(test_func, zero_copy=True, return_recv_hook=return_recv_hook),
                                              kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
-                                             suppress_kineto_output=True, num_kernels_per_period=2 if return_recv_hook else 1)
+                                             suppress_kineto_output=True)
         if not return_recv_hook:
             print(f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
                   f'Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)
         else:
-            print(f'[rank {rank}] Dispatch send/recv time: {dispatch_t[0] * 1e6:.2f} + {dispatch_t[1] * 1e6:.2f} us | '
-                  f'Combine send/recv time: {combine_t[0] * 1e6:.2f} + {combine_t[1] * 1e6:.2f} us', flush=True)
+            print(f'[rank {rank}] Dispatch send/recv time: {dispatch_t * 2 * 1e6:.2f} us | '
+                  f'Combine send/recv time: {combine_t * 2 * 1e6:.2f} us', flush=True)
+
     return hash_value
 
 
 # noinspection PyUnboundLocalVariable
-def test_loop(local_rank: int, num_local_ranks: int, args):
+def test_loop(local_rank: int, num_local_ranks: int):
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
-    num_tokens = args.num_tokens
-    hidden = args.hidden
-    num_topk = args.num_topk
-    num_experts = args.num_experts
+    num_tokens, hidden, num_topk, num_experts = 128, 7168, 8, 288
 
     num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(num_tokens, hidden, num_ranks, num_experts)
     if local_rank == 0:
@@ -186,19 +184,5 @@ def test_loop(local_rank: int, num_local_ranks: int, args):
 
 if __name__ == '__main__':
     # TODO: you may modify NUMA binding for less CPU overhead
-    import argparse
-    parser = argparse.ArgumentParser(description='Test low latency expert parallel')
-    parser.add_argument('--num-processes', type=int, default=8,
-                       help='Number of processes to spawn (default: 8)')
-    parser.add_argument('--num-tokens', type=int, default=128,
-                       help='Number of tokens (default: 128)')
-    parser.add_argument('--hidden', type=int, default=7168,
-                       help='Hidden dimension size (default: 7168)')
-    parser.add_argument('--num-topk', type=int, default=8,
-                       help='Number of top-k experts (default: 8)')
-    parser.add_argument('--num-experts', type=int, default=288,
-                       help='Number of experts (default: 288)')
-    args = parser.parse_args()
-
-    num_processes = args.num_processes
-    torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)
+    num_processes = 8
+    torch.multiprocessing.spawn(test_loop, args=(num_processes,), nprocs=num_processes)

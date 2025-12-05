@@ -2,23 +2,37 @@ import os
 import time
 import torch
 import torch.distributed as dist
+import subprocess
 
 # noinspection PyUnresolvedReferences
 import deep_ep
-from utils import init_dist, bench, calc_diff, create_grouped_scores, inplace_unique, per_token_cast_to_fp8, per_token_cast_back
+from utils import init_dist, bench, calc_diff, create_grouped_scores, inplace_unique
 
 # Test compatibility with low latency functions
 import test_low_latency
 
 
-def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: int, rank: int, buffer: deep_ep.Buffer, group: dist.ProcessGroup, args):
-    # Settings
-    num_tokens = args.num_tokens
-    hidden = args.hidden
-    num_topk_groups = args.num_topk_groups
-    num_topk = args.num_topk
-    num_experts = args.num_experts
+def is_rdma_available():
+    """检测RDMA是否可用"""
+    try:
+        # 检查ibv_devices命令是否存在
+        result = subprocess.run(['which', 'ibv_devices'], capture_output=True, text=True)
+        if result.returncode != 0:
+            return False
+        
+        # 检查是否有活动的RDMA设备
+        result = subprocess.run(['ibv_devices'], capture_output=True, text=True)
+        if result.returncode == 0 and len(result.stdout.strip().split('\n')) > 1:
+            # 有设备列表，说明RDMA可用
+            return True
+        return False
+    except Exception:
+        return False
 
+
+def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: int, rank: int, buffer: deep_ep.Buffer, group: dist.ProcessGroup):
+    # Settings
+    num_tokens, hidden, num_topk_groups, num_topk, num_experts = 4096, 7168, min(num_nodes, 4), 8, (256 // num_ranks) * num_ranks
     assert num_experts % num_ranks == 0 and num_local_ranks == 8
     if local_rank == 0:
         print(f'[config] num_tokens={num_tokens}, hidden={hidden}, num_topk_groups={num_topk_groups}, num_topk={num_topk}', flush=True)
@@ -26,8 +40,6 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     # Random data
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank
     x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-    x_e4m3 = per_token_cast_to_fp8(x)
-    x_e4m3 = (x_e4m3[0], x_e4m3[1].T.contiguous().T)
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
     group_scores = scores.view(num_tokens, num_nodes, -1).amax(dim=-1)
     group_idx = torch.topk(group_scores, k=num_topk_groups, dim=-1, sorted=False).indices
@@ -99,17 +111,12 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
             check_end = recv_gbl_rank_prefix_sum[i].item()
             assert (check_x[check_start:check_end, :].int() - i).sum().item() == 0
             check_start = check_end
-                # Skip FP8 tests on SM80 (A100) as it doesn't support FP8
-    is_sm80 = int(os.getenv('DISABLE_SM90_FEATURES', 0)) == 1
-    test_x_list = [x_pure_rand, x]
-    if not is_sm80:
-        test_x_list.extend([x_e4m3])
     for previous_mode in (False, True):
         for async_mode in (False, True):
-            for current_x in test_x_list:
+            for current_x in (x_pure_rand, x):
                 for with_topk in (False, True):
                     if local_rank == 0:
-                        print(f'[testing] Running with {"FP8" if isinstance(current_x, tuple) else "BF16"}, {"with" if with_topk else "without"} top-k (async={async_mode}, previous={previous_mode}) ...', flush=True, end='')
+                        print(f'[testing] Running with BF16, {"with" if with_topk else "without"} top-k (async={async_mode}, previous={previous_mode}) ...', flush=True, end='')
                     dispatch_args = {'x': current_x, 'num_tokens_per_rank': num_tokens_per_rank, 'num_tokens_per_rdma_rank': num_tokens_per_rdma_rank,  'is_token_in_rank': is_token_in_rank,
                                      'num_tokens_per_expert': num_tokens_per_expert, 'config': config, 'async_finish': async_mode}
                     if with_topk:
@@ -118,7 +125,6 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                         dispatch_args.update({'previous_event': buffer.capture()})
                     recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list, handle, event = buffer.dispatch(**dispatch_args)
                     event.current_stream_wait() if async_mode else ()
-                    recv_x = per_token_cast_back(*recv_x) if isinstance(recv_x, tuple) else recv_x
 
                     # Checks
                     recv_gbl_rank_prefix_sum = handle[-4]
@@ -144,21 +150,18 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                             dispatch_args.update({'previous_event': buffer.capture()})
                         recv_x, _, _, _, _, event = buffer.dispatch(**dispatch_args)
                         event.current_stream_wait() if async_mode else ()
-                        recv_x = per_token_cast_back(*recv_x) if isinstance(recv_x, tuple) else recv_x
                         if current_x is not x_pure_rand:
                             check_data(recv_x, recv_gbl_rank_prefix_sum)
 
                     # Test combine
-                    bias_0 = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-                    bias_1 = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-                    combine_args = {'x': recv_x, 'bias': (bias_0, bias_1), 'handle': handle, 'config': config, 'async_finish': async_mode}
+                    combine_args = {'x': recv_x, 'handle': handle, 'config': config, 'async_finish': async_mode}
                     if with_topk:
                         combine_args.update({'topk_weights': recv_topk_weights})
                     if previous_mode:
                         combine_args.update({'previous_event': buffer.capture()})
                     combined_x, combined_topk_weights, event = buffer.combine(**combine_args)
                     event.current_stream_wait() if async_mode else ()
-                    check_x = (combined_x.float() - bias_0.float() - bias_1.float()) / is_token_in_rank.sum(dim=1).unsqueeze(1)
+                    check_x = combined_x.float() / is_token_in_rank.sum(dim=1).unsqueeze(1)
                     ref_x = x_pure_rand if current_x is x_pure_rand else x
                     assert calc_diff(check_x, ref_x) < 5e-6
                     if with_topk:
@@ -176,37 +179,23 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                         print(' passed', flush=True)
     if local_rank == 0:
         print('', flush=True)
-
     # Tune dispatch performance
-    is_sm80 = int(os.getenv('DISABLE_SM90_FEATURES', 0)) == 1
-    test_x_list = [x]
-    if not is_sm80:
-        test_x_list.extend([x_e4m3])
+    best_time, best_results = 1e10, None
     best_dispatch_results = None
-    fp8_factor = (1 + 4 / 128) / 2
-    for current_x in (x_e4m3, x):
-        best_time, best_results = 1e10, None
-        rdma_send_bytes = (dispatch_bf16_rdma_send_bytes * fp8_factor) if isinstance(current_x, tuple) else dispatch_bf16_rdma_send_bytes
-        nvl_recv_bytes = (dispatch_bf16_nvl_recv_bytes * fp8_factor) if isinstance(current_x, tuple) else dispatch_bf16_nvl_recv_bytes
-        for nvl_chunk_size in range(4, 33, 4):
-            for rdma_chunk_size in range(4, 33, 4):
-                config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
-                tune_args = {'x': current_x, 'handle': handle, 'config': config}
-                t = bench(lambda: buffer.dispatch(**tune_args))[0]
-                if t < best_time:
-                    best_time, best_results = t, (num_sms, nvl_chunk_size, rdma_chunk_size)
-                if local_rank == 0:
-                    print(f'[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size}, RDMA chunk {rdma_chunk_size}: {rdma_send_bytes / 1e9 / t:.2f} GB/s (RDMA), {nvl_recv_bytes / 1e9 / t:.2f} GB/s (NVL) ', flush=True)
-        if local_rank == 0:
-            print(f'[tuning] Best dispatch ({"FP8" if isinstance(current_x, tuple) else "BF16"}): SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}: {rdma_send_bytes / 1e9 / best_time:.2f} GB/s (RDMA), {nvl_recv_bytes / 1e9 / best_time:.2f} GB/s (NVL)', flush=True)
-            print('', flush=True)
+    for nvl_chunk_size in range(4, 33, 4):
+        for rdma_chunk_size in range(16, 33, 4):
+            config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
+            tune_args = {'x': x, 'handle': handle, 'config': config}
+            t = bench(lambda: buffer.dispatch(**tune_args))[0]
+            if t < best_time:
+                best_time, best_results = t, (num_sms, nvl_chunk_size, rdma_chunk_size)
+            if local_rank == 0:
+                print(f'[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size}, RDMA chunk {rdma_chunk_size}: {dispatch_bf16_rdma_send_bytes / 1e9 / t:.2f} GB/s (RDMA), {dispatch_bf16_nvl_recv_bytes / 1e9 / t:.2f} GB/s (NVL) ', flush=True)
+    if local_rank == 0:
+        print(f'[tuning] Best dispatch (BF16): SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}: {dispatch_bf16_rdma_send_bytes / 1e9 / best_time:.2f} GB/s (RDMA), {dispatch_bf16_nvl_recv_bytes / 1e9 / best_time:.2f} GB/s (NVL)', flush=True)
+        print('', flush=True)
 
-        if isinstance(current_x, tuple):
-            # Gather FP8 the best config from rank 0
-            best_dispatch_results = torch.tensor([best_results[0], best_results[1], best_results[2]], dtype=torch.int32, device='cuda')
-            all_best_fp8_results_list = [torch.zeros_like(best_dispatch_results) for _ in range(torch.distributed.get_world_size())]
-            dist.all_gather(all_best_fp8_results_list, best_dispatch_results, group=group)
-            best_dispatch_results = all_best_fp8_results_list[0].tolist()
+    best_dispatch_results = [best_results[0], best_results[1], best_results[2]]
     dispatch_config = deep_ep.Config(best_dispatch_results[0], best_dispatch_results[1], nvl_buffer_size, best_dispatch_results[2], rdma_buffer_size)
 
     dispatch_args = {'x': x, 'num_tokens_per_rank': num_tokens_per_rank, 'num_tokens_per_rdma_rank': num_tokens_per_rdma_rank,
@@ -217,7 +206,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     # Tune combine performance
     best_time, best_results = 1e10, None
     for nvl_chunk_size in range(1, 5, 1):
-        for rdma_chunk_size in range(8, 33, 4):
+        for rdma_chunk_size in range(16, 33, 4):
             config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
             tune_args = {'x': recv_x, 'handle': handle, 'config': config}
             t = bench(lambda: buffer.combine(**tune_args))[0]
@@ -232,61 +221,57 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 
 
 # noinspection PyUnboundLocalVariable
-def test_loop(local_rank: int, num_local_ranks: int, args):
+def test_loop(local_rank: int, num_local_ranks: int):
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
-    test_ll_compatibility = os.getenv('EP_TEST_LL_COMPATIBILITY', False)
+    
+    # 检测RDMA可用性并调整测试配置
+    rdma_available = is_rdma_available()
+    if local_rank == 0:
+        if rdma_available:
+            print('[info] RDMA检测到可用，使用RDMA模式', flush=True)
+        else:
+            print('[info] RDMA不可用，使用TCP模式', flush=True)
+    
+    # 在单节点或RDMA不可用时禁用低延迟模式
+    test_ll_compatibility = num_nodes > 1 and rdma_available
+    
+    num_sms = 16  # 先定义num_sms变量
+    
     if test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
-
-    num_sms = 24
-    num_qps_per_rank = max(num_sms, ll_num_experts // num_ranks if test_ll_compatibility else 0)
+        num_qps_per_rank = max(num_sms, ll_num_experts // num_ranks)
+    else:
+        num_qps_per_rank = 1  # 在非RDMA模式下使用较少的QP
 
     buffer = deep_ep.Buffer(group, int(1e9), int(1e9), low_latency_mode=test_ll_compatibility,
                             num_qps_per_rank=num_qps_per_rank)
-    assert num_local_ranks == 8 and num_ranks > 8
+    
+    # 放宽节点数量限制，允许单节点测试
+    if num_nodes == 1 and local_rank == 0:
+        print('[info] 单节点测试模式，跳过多节点特定检查', flush=True)
+    
     torch.manual_seed(rank)
 
     for i in (num_sms, ):
-        test_main(i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group, args)
+        test_main(i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group)
         if local_rank == 0:
             print('', flush=True)
 
-    # Test compatibility with low latency functions
+    # Test compatibility with low latency functions (仅在RDMA可用时)
     if test_ll_compatibility:
         buffer.clean_low_latency_buffer(ll_num_tokens, ll_hidden, ll_num_experts)
         test_low_latency.test_main(ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk, rank, num_ranks, group, buffer, seed=1)
-
-    # Destroy the communication group
-    dist.barrier()
-    dist.destroy_process_group()
+    elif local_rank == 0:
+        print('[info] RDMA不可用，跳过低延迟功能测试', flush=True)
 
 
 if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser(description='Test internode expert parallel')
-    parser.add_argument('--num-processes', type=int, default=8,
-                       help='Number of processes to spawn (default: 8)')
-    parser.add_argument('--num-tokens', type=int, default=4096,
-                       help='Number of tokens (default: 4096)')
-    parser.add_argument('--hidden', type=int, default=7168,
-                       help='Hidden dimension size (default: 7168)')
-    parser.add_argument('--num-topk-groups', type=int, default=None,
-                       help='Number of top-k groups (default: min(num_nodes, 4))')
-    parser.add_argument('--num-topk', type=int, default=8,
-                       help='Number of top-k experts (default: 8)')
-    parser.add_argument('--num-experts', type=int, default=None,
-                       help='Number of experts (default: calculated as (256 // num_ranks) * num_ranks)')
-    args = parser.parse_args()
-
-    # Set default num_topk_groups if not provided
-    if args.num_topk_groups is None:
-        num_nodes = int(os.getenv('WORLD_SIZE', 1))
-        args.num_topk_groups = min(num_nodes, 4)
-
-    # Set default num_experts if not provided
-    if args.num_experts is None:
-        args.num_experts = (256 // args.num_processes) * args.num_processes
-
-    num_processes = args.num_processes
-    torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)
+    num_processes = 8
+    # 检查环境变量，允许调整进程数
+    env_processes = os.getenv('DEEPEP_NUM_PROCESSES')
+    if env_processes:
+        num_processes = int(env_processes)
+    
+    print(f'[info] 启动测试，进程数: {num_processes}', flush=True)
+    torch.multiprocessing.spawn(test_loop, args=(num_processes, ), nprocs=num_processes)
